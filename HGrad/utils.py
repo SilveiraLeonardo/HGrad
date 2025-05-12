@@ -1,4 +1,5 @@
 from graphviz import Digraph
+import numpy as np
 
 def trace(root):
     # builds a set of all nodes and edges in a graph
@@ -44,3 +45,12 @@ def draw_graph(root):
         dot.edge(str(id(n1)), str(id(n2)) + n2._op)
 
     return dot
+
+# utility function to compare manual to pytorch gradients
+def cmp_torch(s, dt, t):
+    ex = np.all(dt.grad == t.grad.numpy())
+    app = np.allclose(dt.grad, t.grad.numpy())
+    maxdiff = np.max(np.abs(dt.grad - t.grad.numpy()))
+    #print(dt.grad)
+    #print(t.grad.numpy())
+    print(f'{s:15s} | exact {str(ex):5s} | app {str(app):5s} | maxdiff: {maxdiff}')

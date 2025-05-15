@@ -27,6 +27,9 @@ class Linear:
     def parameters(self):
         return [self.weight] + ([] if self.bias is None else [self.bias])
 
+    def nelement(self):
+        return int(sum(np.prod(p.shape) for p in self.parameters()))
+
 class Embedding:
     def __init__(self, num_embedding, embedding_dim, label="Embeddings"):
         self.weight = normal((num_embedding,embedding_dim))
@@ -39,6 +42,44 @@ class Embedding:
 
     def parameters(self):
         return [self.weight]
+    
+    def nelement(self):
+        return int(sum(np.prod(p.shape) for p in self.parameters()))
+
+class Flatten:
+    def __call__(self, x):
+        self.out = x.view((x.shape[0], -1))
+
+        return self.out
+
+    def parameters(self):
+        return []
+    
+    def nelement(self):
+        return 0
+
+class FlattenConsecutive:
+    def __init__(self, n):
+        self.n = n # number of elements is last dimension
+
+    def __call__(self, x):
+        B, T, C = x.shape
+
+        x = x.view((B, T//self.n, C*self.n))
+
+        if x.shape[1] == 1:
+            # if T//self.n is 1, remove this dimension
+            x = x.squeeze(1)
+
+        self.out = x
+
+        return self.out
+
+    def parameters(self):
+        return []
+    
+    def nelement(self):
+        return 0
 
 class PReLU:
     def __init__(self, init=0.25):
@@ -51,6 +92,9 @@ class PReLU:
 
     def parameters(self):
         return [self.a]
+    
+    def nelement(self):
+        return int(sum(np.prod(p.shape) for p in self.parameters()))
 
 class Tanh:
     def __call__(self, x):
@@ -60,6 +104,9 @@ class Tanh:
 
     def parameters(self):
         return []
+    
+    def nelement(self):
+        return 0
 
 class BatchNorm:
     def __init__(self, n_hidden, eps=1e-6, momentum=0.1):
@@ -93,3 +140,6 @@ class BatchNorm:
 
     def parameters(self):
         return [self.gamma, self.beta]
+    
+    def nelement(self):
+        return int(sum(np.prod(p.shape) for p in self.parameters()))

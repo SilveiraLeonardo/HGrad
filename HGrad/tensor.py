@@ -2,7 +2,6 @@ import numpy as np
 
 class Tensor:
     def __init__(self, data, _parents=(), _op='', label=''):
-        # transform data into np.array, don't know if the type is correct
         data = data if isinstance(data, type(np.array([]))) else np.array(data)
         
         self.data = np.ascontiguousarray(data)
@@ -37,32 +36,75 @@ class Tensor:
         out._backward = _backward
 
         return out
+    
+    def unsqueeze(self, axis):
+
+        out = Tensor(np.expand_dims(self.data, axis=axis), (self,))
+        
+        def _backward():
+            pass
+        
+        out._backward = _backward
+
+        return out
+
+    def squeeze(self, axis=None):
+        out = Tensor(np.squeeze(self.data, axis=axis), (self,), 'squeeze')
+        
+        def _backward():
+            self.grad += out.grad.reshape(self.data.shape)
+        
+        out._backward = _backward
+
+        return out
+
 
     def __add__(self, other):
 
-        # if bias vector is one dimensional, make it a row vector
-        if len(self.data.shape) > len(other.shape):
-            other = np.expand_dims(other.data, axis=0)
-        if len(self.data.shape) < len(other.shape):
-            self.data = np.expand_dims(self.data, axis=0)
+        other = other if isinstance(other, Tensor) else Tensor(other)        
 
-        other = other if isinstance(other, Tensor) else Tensor(other)
+        a, b = self.data, other.data
 
-        out = Tensor(self.data + other.data, (self, other), '+')
-        
+        # forward — numpy will broadcast a and b to the same shape
+        out_data = a + b
+        out = Tensor(out_data, (self, other), '+')
+
         def _backward():
-            # if the value summed was broadcasted, sum the upstream gradient over the rows
-            # allows two possibilities: dimensions match (m, n) and (m, n)
-            # first dimension is broadcastable (1, n) and (m, n)
-            if out.grad.shape[0]==self.data.shape[0]: 
-                self.grad += out.grad
-            else:
-                self.grad += out.grad.sum(axis=0)
+            grad = out.grad
+            # shapes
+            a_shape = a.shape
+            b_shape = b.shape
+            out_shape = grad.shape
 
-            if out.grad.shape[0]==other.data.shape[0]: 
-                other.grad += out.grad
-            else:
-                other.grad += out.grad.sum(axis=0)
+            # helper to find which axes to reduce over
+            def _get_axes(orig_shape, result_shape):
+                # pad orig_shape on the left with 1s to match len(result_shape)
+                ndims = len(result_shape)
+                padded = (1,) * (ndims - len(orig_shape)) + orig_shape
+                # any axis where padded == 1 but result > 1 was broadcasted
+                return tuple(i for i, (s_padded, s_out) in
+                             enumerate(zip(padded, result_shape))
+                             if s_padded == 1 and s_out > 1)
+
+            # compute grad wrt b
+            axes_b = _get_axes(b_shape, out_shape)
+            grad_b = grad
+            if axes_b:
+                grad_b = grad.sum(axis=axes_b, keepdims=True)
+            grad_b = grad_b.reshape(b_shape)
+            other.grad += grad_b
+            
+            # compute grad wrt a
+            axes_a = _get_axes(a_shape, out_shape)
+            grad_a = grad
+            if axes_a:
+                grad_a = grad.sum(axis=axes_a, keepdims=True)
+            # finally, reshape back to original a_shape in case we prepended dims
+            grad_a = grad_a.reshape(a_shape)
+            self.grad += grad_a
+
+        out._backward = _backward
+        return out
 
         out._backward = _backward
 
@@ -92,25 +134,40 @@ class Tensor:
 
         other = other if isinstance(other, Tensor) else Tensor(other)
         
-        out = Tensor(self.data * other.data, (self, other), '*')
+        a, b = self.data, other.data
+
+        out_data = a * b
+        out = Tensor(out_data, (self, other), '*')
 
         def _backward():
-            # if the value multiplied was broadcasted, sum the upstream gradient over the rows
-            # allows two possibilities: dimensions match (m, n) and (m, n)
-            # first dimension is broadcastable (1, n) and (m, n)
-            if len(self.shape) == 0:
-                self.grad += (out.grad * other.data).sum()
-            elif out.grad.shape[0]==self.data.shape[0]: 
-                self.grad += out.grad * other.data
-            else:
-                self.grad += (out.grad * other.data).sum(axis=0)
+            # we’ll make a tiny helper to accumulate grads
+            def _acc_grad(var, var_data, other_data):
+                # raw gradient w.r.t. var is upstream * the other operand’s data
+                grad = out.grad * other_data
 
-            if len(other.shape) == 0:
-                other.grad += (out.grad * self.data).sum()
-            elif out.grad.shape[0]==other.data.shape[0]: 
-                other.grad += out.grad * self.data
-            else:
-                other.grad += (out.grad * self.data).sum(axis=0)
+                # figure out which axes were broadcast in var
+                out_shape = out_data.shape
+                var_shape = var_data.shape
+                # left-pad var_shape with 1’s to match len(out_shape)
+                ndiff = len(out_shape) - len(var_shape)
+                var_shape_ext = (1,) * ndiff + var_shape
+
+                # any dimension where var_shape_ext==1 but out_shape>1 was broadcast
+                axes = tuple(
+                    i for i, (vs, os) in enumerate(zip(var_shape_ext, out_shape))
+                    if vs == 1 and os > 1
+                )
+                if axes:
+                    # sum out the broadcasted axes
+                    grad = grad.sum(axis=axes)
+
+                # reshape back to the original var shape
+                grad = grad.reshape(var_shape)
+                var.grad += grad
+
+            # accumulate for self and other
+            _acc_grad(self, self.data, other.data)
+            _acc_grad(other, other.data, self.data)
 
         out._backward = _backward
         return out
@@ -122,11 +179,36 @@ class Tensor:
 
         other = other if isinstance(other, Tensor) else Tensor(other)
 
-        out = Tensor(self.data @ other.data, (self, other), '@')
+        A = self.data
+        B = other.data
+
+        # forward
+        C = A @ B
+        out = Tensor(C, (self, other), '@')
 
         def _backward():
-            self.grad += out.grad @ other.data.T
-            other.grad += self.data.T @ out.grad
+            G = out.grad  # ∂L/∂C, same shape as C
+
+            # grad w.r.t. A: G @ B^T
+            grad_A = G @ np.swapaxes(B, -1, -2)
+            # grad w.r.t. B: A^T @ G
+            grad_B = np.swapaxes(A, -1, -2) @ G
+            # if A or B were broadcast in the forward pass, we need
+            # to sum‐reduce the extra dims:
+
+            if grad_A.shape != A.shape:
+                # any leading dims in grad_A that A didn’t have
+                extra_axes = tuple(range(grad_A.ndim - A.ndim))
+                grad_A = grad_A.sum(axis=extra_axes)
+            if grad_B.shape != B.shape:
+                extra_axes = tuple(range(grad_B.ndim - B.ndim))
+                grad_B = grad_B.sum(axis=extra_axes)
+
+            self.grad += grad_A
+            other.grad += grad_B
+
+            #self.grad += out.grad @ other.data.T
+            #other.grad += self.data.T @ out.grad
 
         out._backward = _backward
 
@@ -167,12 +249,6 @@ class Tensor:
             pass
 
         out._backward = _backward
-        return out
-
-    def unsqueeze(self, axis):
-
-        out = Tensor(np.expand_dims(self.data, axis=axis), (self,))
-
         return out
 
     def log(self):
@@ -279,29 +355,32 @@ class Tensor:
         out._backward = _backward
 
         return out
-    
+   
     def batch_norm(self, epsilon=1e-6):
 
-        # working only for inputs with 2 dimensions, if 3 dimensions needs modifications:
-        #if x.ndim == 2:
-        #    dim = 0 # reduce over the batch dimension
-        #elif x.ndim == 3:
-        #    dim = (0,1) # reduce over the firts two dimensions
-        #    # example: input is (32, 4, 20) => we want the batch norm
-        #    # of only the 20 examples in the last dimension
-        #xmean = x.mean(dim, keepdim=True)
-        #xvar = x.var(dim, keepdim=True)
+        # 1) decide which axes to reduce over:
+        #    we will *not* reduce over the last axis,
+        #    so: ex: if ndim=3: axes = (0, 1)
+        axes = tuple(range(self.data.ndim - 1))
 
-        m = self.data.shape[0]
-        mu_b = np.mean(self.data, 0, keepdims=True)
-        # ddof=1: use Bessel's correction
-        var_b = np.var(self.data, 0, ddof=1, keepdims=True)
-        numerator = self.data - mu_b
-        denominator_inv = np.sqrt(var_b + epsilon) ** -1
-        out = Tensor(numerator * denominator_inv, (self,), 'batch_norm')
+        # 2) forward pass
+        mu_b = np.mean(self.data, axis=axes, keepdims=True)
+        var_b = np.var(self.data, axis=axes, ddof=1, keepdims=True)
+        inv_std = np.sqrt(var_b + epsilon) ** -1
+        x_centered = self.data - mu_b
+        out_data = x_centered * inv_std
+
+        out = Tensor(out_data, (self,), 'batch_norm')
+
+        # calculate the number of batches, multiplying all the batch dimensions
+        m = np.prod([self.data.shape[a] for a in axes], dtype=float)
 
         def _backward():
-            self.grad += (denominator_inv / m) * (m * out.grad - out.grad.sum(0) - (m / (m-1)) * out.data * (out.grad * out.data).sum(0))
+            #dx = (1/N)·inv_std·(N·dL/dy – sum(dL/dy) – (N/(N-1)·y·sum(dL/dy·y))
+            out_grad_sum = np.sum(out.grad, axis=axes, keepdims=True)
+            out_grad_out_data_sum = np.sum(out.grad * out.data, axis=axes, keepdims=True)
+
+            self.grad += (1.0/m) * inv_std * (m * out.grad - out_grad_sum - (m / (m-1)) * out.data * out_grad_out_data_sum)
 
         out._backward = _backward
 

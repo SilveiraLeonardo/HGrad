@@ -6,6 +6,10 @@ class Tensor:
         
         self.data = np.ascontiguousarray(data)
         self.grad = np.zeros_like(data)
+
+        self.velocity = np.zeros_like(data) # momentum/velocity coeffs
+        self.s = np.zeros_like(data) # running average of squared gradients
+
         self.shape = data.shape
         self._backward = lambda: None
         self._prev = set(_parents)
@@ -58,6 +62,32 @@ class Tensor:
 
         return out
 
+    def transpose(self, dim1, dim2):
+        out = Tensor(np.swapaxes(self.data, dim1, dim2), (self,), 'transpose')
+
+        def _backward():
+            self.grad += np.swapaxes(out.grad, dim2, dim1)
+
+        out._backward = _backward
+
+        return out
+
+    def masked_fill(self, mask, value):
+       
+        mask_data = mask.data if isinstance(mask, Tensor) else mask
+        value_data = value.data  if isinstance(value, Tensor) else value
+
+        out_data = self.data.copy()
+        out_data = np.where(~mask_data, value_data, out_data)
+
+        out = Tensor(out_data, (self,), 'masked_fill')
+
+        def _backward():
+            self.grad += np.where(~mask_data, 0.0, out.grad)
+
+        out._backward = _backward
+
+        return out
 
     def __add__(self, other):
 
@@ -385,20 +415,66 @@ class Tensor:
         out._backward = _backward
 
         return out, mu_b, var_b
+    
+    def layer_norm(self, epsilon=1e-6):
 
-    def softmax(self):
+        B, T, C = self.data.shape
 
-        logit_maxes = self.data.max(1, keepdims=True) #(batch_size, 1)
+        mu = np.mean(self.data, axis=-1, keepdims=True) # (B, T, 1)
+        var = np.var(self.data, axis=-1, keepdims=True) # (B, T, 1)
+        inv_std = np.sqrt(var + epsilon) ** -1 # (B, T, 1)
+        x_centered = self.data - mu # (B, T, C)
+        out_data = x_centered * inv_std # (B, T, C)
+
+        out = Tensor(out_data, (self,), 'layer_norm')
+
+        def _backward():
+            #dx = (1/N)·inv_std·(N·dL/dy – sum(dL/dy) – (N/(N-1)·y·sum(dL/dy·y))
+            out_grad_sum = np.sum(out.grad, axis=-1, keepdims=True)
+            out_grad_out_data_sum = np.sum(out.grad * out.data, axis=-1, keepdims=True)
+
+            self.grad += (1.0/C) * inv_std * (C * out.grad - out_grad_sum - out.data * out_grad_out_data_sum)
+
+        out._backward = _backward
+
+        return out
+
+    def dropout(self, p):
+        
+        self_data = self.data
+
+        keep_prob = 1.0 - p
+
+        # create a mask with the same shape
+        # * unpacks the tuple into individual arguments.
+        mask = np.random.rand(*self.data.shape) > p
+
+        out_data = (self_data * mask) / keep_prob # divide by the keep probability
+
+        out = Tensor(out_data, (self,), 'dropout')
+
+        def _backward():
+            self.grad += out.grad * mask / keep_prob
+
+        out._backward = _backward
+
+        return out
+
+    def softmax(self, dim=1):
+
+        logit_maxes = self.data.max(dim, keepdims=True) #(batch_size, 1)
         norm_logits = self.data - logit_maxes # (batch_size, classes) subtract max for numerical stability
         counts = np.exp(norm_logits) # (batch_size, classes)
-        counts_sum = counts.sum(1, keepdims=True) # (batch_size, 1)
+        counts_sum = counts.sum(dim, keepdims=True) # (batch_size, 1)
         counts_sum_inv = counts_sum ** -1 # (batch_size, 1)
         probs = counts * counts_sum_inv # (batch_size, classes)
 
         out = Tensor(probs, (self,), 'softmax')
 
         def _backward():
-            pass
+            tmp = (out.grad * out.data).sum(dim, keepdims=True)
+            grad_z = out.data * (out.grad - tmp)
+            self.grad += grad_z
 
         out._backward = _backward
 
@@ -473,3 +549,16 @@ class Tensor:
             node._backward()
 
 
+def concat(tensors, dim=0):
+    # forward pass
+    out_data = np.concatenate([t.data for t in tensors], axis=dim)
+    out = Tensor(out_data, set(tensors), 'concat')
+
+    def _backward():
+        grads = np.split(out.grad, len(tensors), axis=dim)
+        for t, g in zip(tensors, grads):
+            t.grad += g
+
+    out._backward = _backward
+
+    return out
